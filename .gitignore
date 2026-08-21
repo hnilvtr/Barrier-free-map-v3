@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual Environment
+.venv/
+backend/.venv/
+
+# Environment
+.env
+backend/.env
+
+# IDE
+.idea/
+
+# 코드 분석 도구 캐시(프로젝트 코드 아님)
+.ua/
+
+# Claude Code 내부 상태 파일
+.claude/scheduled_tasks.lock

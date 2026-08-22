@@ -20,17 +20,39 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 GEOJSON_PATH = os.path.join(DATA_DIR, "성남시_보행망.geojson")
 
 
+_seongnam_walking_network_cache: dict[str, Any] | None = None
+_seongnam_walking_network_load_attempted = False
+
+
 def load_seongnam_walking_network():
-    """성남시 보행망 GeoJSON 데이터 로드"""
+    """
+    성남시 보행망 GeoJSON 데이터를 로드한다.
+
+    51MB/58,364개 feature짜리 정적 파일이라 매 호출마다 다시 읽고
+    파싱하면 호출당 약 700ms가 낭비된다(실측). 실시간으로 바뀌는
+    데이터가 아니므로 프로세스 생애주기 동안 한 번만 읽어 캐싱한다.
+    """
+
+    global _seongnam_walking_network_cache
+    global _seongnam_walking_network_load_attempted
+
+    if _seongnam_walking_network_load_attempted:
+        return _seongnam_walking_network_cache
+
+    _seongnam_walking_network_load_attempted = True
+
     if os.path.exists(GEOJSON_PATH):
         try:
             with open(GEOJSON_PATH, "r", encoding="utf-8") as f:
                 content = f.read()
-                return json.loads(content, strict=False)
+                _seongnam_walking_network_cache = json.loads(content, strict=False)
         except Exception as e:
             print(f"[경고] GeoJSON 로드 중 오류 발생: {e}")
-            return None
-    return None
+            _seongnam_walking_network_cache = None
+    else:
+        _seongnam_walking_network_cache = None
+
+    return _seongnam_walking_network_cache
 
 
 def calculate_distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -178,76 +200,175 @@ def simplify_walking_route(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def detect_slopes_on_path(
-    path_coordinates: list[list[float]], slope_threshold: float = 8.0
-) -> list[dict[str, Any]]:
-    """경사도 8.0% 이상의 급경사 구간만 정확히 감지"""
-    network = load_seongnam_walking_network()
-    if not network:
-        return []
+SEARCH_RADIUS_METERS = 80.0  # 경로 주변 이내 보행망 체크 반경
 
-    detected_slopes = []
+# 공간 인덱스 격자 한 칸 크기(도 단위, 위도 기준 약 111m).
+# SEARCH_RADIUS_METERS보다 크게 잡아야 3x3 이웃 칸 조회만으로
+# 반경 안의 모든 지점을 놓치지 않고 찾을 수 있다.
+_SLOPE_INDEX_CELL_SIZE_DEG = 0.001
+
+_slope_spatial_index_cache: (
+    dict[tuple[int, int], list[tuple[float, float, float, str, int]]] | None
+) = None
+
+
+def _extract_slope_geometry_coords(
+    geom: dict[str, Any],
+) -> list[tuple[float, float]]:
+    """feature의 geometry에서 (lat, lng) 좌표 목록을 뽑는다."""
+
+    geom_type = geom.get("type")
+    coords: list[tuple[float, float]] = []
+
+    if geom_type == "MultiLineString":
+        for line_coords in geom.get("coordinates", []):
+            for coord in line_coords:
+                if len(coord) >= 2:
+                    coords.append((float(coord[1]), float(coord[0])))
+    elif geom_type == "LineString":
+        for coord in geom.get("coordinates", []):
+            if len(coord) >= 2:
+                coords.append((float(coord[1]), float(coord[0])))
+    elif geom_type == "Point":
+        pt_coords = geom.get("coordinates", [])
+        if len(pt_coords) >= 2:
+            coords.append((float(pt_coords[1]), float(pt_coords[0])))
+
+    return coords
+
+
+def _build_slope_spatial_index(
+    network: dict[str, Any],
+) -> dict[tuple[int, int], list[tuple[float, float, float, str, int]]]:
+    """
+    보행망 GeoJSON의 경사도 있는 지점들을 위경도 격자로 미리 묶어둔다.
+
+    detect_slopes_on_path()가 경로 좌표 하나당 58,364개 feature 전체를
+    순회하던 것을(실측 O(경로좌표 수 × feature 수)) 경로 좌표 주변
+    격자 몇 칸만 조회하도록 바꾸기 위한 사전 준비 단계다. 프로세스
+    생애주기 동안 한 번만 만들면 된다.
+    """
+
+    index: dict[
+        tuple[int, int],
+        list[tuple[float, float, float, str, int]],
+    ] = {}
+
     features = network.get("features", [])
-    SEARCH_RADIUS_METERS = 80.0  # 경로 주변 80m 이내 보행망 체크
 
-    for feature in features:
+    for feature_id, feature in enumerate(features):
+
         props = feature.get("properties", {})
         geom = feature.get("geometry", {})
 
-        # 1. grade_100m 속성 읽기 (0.08 = 8%)
-        raw_grade = props.get("grade_100m") or props.get("grade_local") or props.get("slope_deg") or props.get("slope")
-        
+        raw_grade = (
+            props.get("grade_100m")
+            or props.get("grade_local")
+            or props.get("slope_deg")
+            or props.get("slope")
+        )
+
         if raw_grade is None:
             continue
 
         try:
             raw_val = abs(float(raw_grade))
-            # 소수점 비율(0.08)을 퍼센트(8.0%)로 변환
             slope_val = raw_val * 100.0 if raw_val < 1.0 else raw_val
         except (ValueError, TypeError):
             continue
 
-        # 💡 [조건] 경사도가 지정한 임계값(8.0%) 이상일 때만 감지
-        if slope_val >= slope_threshold:
-            geom_type = geom.get("type")
-            coords_to_check = []
+        road_name = str(
+            props.get("walk_class") or props.get("명칭") or "급경사 구간"
+        )
 
-            if geom_type == "MultiLineString":
-                multi_coords = geom.get("coordinates", [])
-                for line_coords in multi_coords:
-                    for coord in line_coords:
-                        if len(coord) >= 2:
-                            coords_to_check.append((float(coord[1]), float(coord[0])))
-            elif geom_type == "LineString":
-                line_coords = geom.get("coordinates", [])
-                for coord in line_coords:
-                    if len(coord) >= 2:
-                        coords_to_check.append((float(coord[1]), float(coord[0])))
-            elif geom_type == "Point":
-                pt_coords = geom.get("coordinates", [])
-                if len(pt_coords) >= 2:
-                    coords_to_check.append((float(pt_coords[1]), float(pt_coords[0])))
+        for lat, lng in _extract_slope_geometry_coords(geom):
+            cell = (
+                int(lat // _SLOPE_INDEX_CELL_SIZE_DEG),
+                int(lng // _SLOPE_INDEX_CELL_SIZE_DEG),
+            )
+            index.setdefault(cell, []).append(
+                (lat, lng, slope_val, road_name, feature_id)
+            )
 
-            is_matched = False
-            for s_lat, s_lng in coords_to_check:
-                for p_lng, p_lat in path_coordinates:
-                    dist = calculate_distance_meters(s_lat, s_lng, float(p_lat), float(p_lng))
+    return index
+
+
+def _get_slope_spatial_index() -> (
+    dict[tuple[int, int], list[tuple[float, float, float, str, int]]]
+):
+    global _slope_spatial_index_cache
+
+    if _slope_spatial_index_cache is not None:
+        return _slope_spatial_index_cache
+
+    network = load_seongnam_walking_network()
+
+    _slope_spatial_index_cache = (
+        _build_slope_spatial_index(network) if network else {}
+    )
+
+    return _slope_spatial_index_cache
+
+
+def detect_slopes_on_path(
+    path_coordinates: list[list[float]], slope_threshold: float = 8.0
+) -> list[dict[str, Any]]:
+    """
+    경사도 8.0% 이상의 급경사 구간만 정확히 감지한다(공간 인덱스 기반).
+
+    경로 좌표마다 자신이 속한 격자 칸 + 주변 8칸만 조회하므로,
+    전체 feature 수(58,364개)와 무관하게 경로 길이에 비례하는
+    비용만 든다. feature 하나당 결과는 하나만 남긴다(기존 동작과 동일).
+    """
+
+    spatial_index = _get_slope_spatial_index()
+
+    if not spatial_index:
+        return []
+
+    detected_slopes: list[dict[str, Any]] = []
+    matched_feature_ids: set[int] = set()
+
+    for p_lng, p_lat in path_coordinates:
+
+        p_lat = float(p_lat)
+        p_lng = float(p_lng)
+
+        cell_x = int(p_lat // _SLOPE_INDEX_CELL_SIZE_DEG)
+        cell_y = int(p_lng // _SLOPE_INDEX_CELL_SIZE_DEG)
+
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+
+                bucket = spatial_index.get(
+                    (cell_x + dx, cell_y + dy)
+                )
+
+                if not bucket:
+                    continue
+
+                for s_lat, s_lng, slope_val, road_name, feature_id in bucket:
+
+                    if (
+                        slope_val < slope_threshold
+                        or feature_id in matched_feature_ids
+                    ):
+                        continue
+
+                    dist = calculate_distance_meters(
+                        s_lat, s_lng, p_lat, p_lng
+                    )
 
                     if dist <= SEARCH_RADIUS_METERS:
-                        road_name = props.get("walk_class") or props.get("명칭") or "급경사 구간"
+                        matched_feature_ids.add(feature_id)
                         detected_slopes.append(
                             {
-                                "name": str(road_name),
+                                "name": road_name,
                                 "latitude": round(s_lat, 6),
                                 "longitude": round(s_lng, 6),
                                 "slope_degree": round(slope_val, 1),
                             }
                         )
-                        is_matched = True
-                        break
-
-                if is_matched:
-                    break
 
     print(f"🔍 [백엔드 로그] 감지된 8% 이상 급경사로 개수: {len(detected_slopes)}개")
     return detected_slopes
